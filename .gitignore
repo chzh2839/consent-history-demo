@@ -1,0 +1,22 @@
+# Maven 빌드 산출물
+target/
+*.class
+
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+
+# Spring Boot 로컬 설정
+application-local.yml
+application-local.yaml
+
+# 로그
+*.log
+logs/
+
+# OS 메타파일
+.DS_Store
+Thumbs.db
