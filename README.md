@@ -1,118 +1,153 @@
-# consent-history-demo
-
-> **약관 버전 관리 및 동의 이력 추적 데모 프로젝트**  
-> Spring Boot + JPA + H2 기반의 최소 구현체
+# 약관 버전 관리 & 동의 이력 추적 시스템
 
 ---
 
-## 왜 만들었는가
+## 목차
 
-실무에서 약관 시스템을 설계·구현한 경험을 코드로 명확하게 보여주기 위해 만들었습니다.
-
-약관 관리는 단순 CRUD처럼 보이지만, 실제로는 다음과 같은 까다로운 요구사항이 숨어 있습니다.
-
-- **"사용자가 동의한 시점의 약관 내용"** 을 언제든 재현할 수 있어야 한다
-- **개정된 약관에 재동의** 유도가 필요하고, 그 이전 동의 이력도 보존해야 한다
-- **규제/감사 대응** 을 위해 동의·철회 모든 행위가 이력으로 남아야 한다
-
-이 프로젝트는 그 핵심 설계 원칙을 가장 단순한 형태로 구현합니다.
-
----
-
-## 약관 버전 관리의 필요성
-
-### ❌ 버전 관리 없이 약관을 수정하면
-
-```
-[기존 방식]
-terms 테이블: content = "약관 내용 v1.0"
-→ 개정 시: content = "약관 내용 v2.0" 으로 UPDATE
-
-문제: 사용자가 v1.0에 동의했는데, 지금 조회하면 v2.0 내용이 보인다.
-     → "동의한 내용"과 "보이는 내용"이 달라진다.
-```
-
-### ✅ 버전 관리를 도입하면
-
-```
-[이 프로젝트의 방식]
-terms_version 테이블에 버전별로 INSERT (절대 UPDATE 안 함)
-
-v1.0 레코드: "약관 내용 v1.0", is_active=false
-v2.0 레코드: "약관 내용 v2.0", is_active=true  ← 현행
-
-동의 이력에는 terms_version_id를 저장
-→ 사용자가 동의한 시점의 내용을 언제든 정확히 재현 가능
-```
+1. [프로젝트 소개](#1-프로젝트-소개)
+2. [해결한 문제](#2-해결한-문제)
+3. [기술 스택](#3-기술-스택)
+4. [아키텍처 개요](#4-아키텍처-개요)
+5. [기술적 선택 근거](#5-기술적-선택-근거)
+6. [ERD](#6-erd)
+7. [API 명세](#7-api-명세)
+8. [동의 처리 흐름 상세](#8-동의-처리-흐름-상세)
+9. [트러블슈팅](#9-트러블슈팅)
+10. [한계 및 개선 방향](#10-한계-및-개선-방향)
+11. [테스트](#11-테스트)
+12. [실행 방법](#12-실행-방법)
 
 ---
 
-## 핵심 설계 원칙
+## 1. 프로젝트 소개
 
-### 1. 약관 버전의 불변성 (Immutability)
+약관 동의 이력을 관리하는 서버다. 회원가입할 때 이용약관, 개인정보처리방침, 마케팅 수신동의 같은 약관에 동의를 받는데, 이 약관이 나중에 개정되면 "그때 동의한 내용"과 "지금 화면에 보이는 내용"이 달라지는 문제가 생긴다.
 
-`terms_version` 레코드는 **INSERT Only**, 절대 UPDATE/DELETE하지 않습니다.
-
-약관이 개정되면:
-1. 기존 활성 버전: `is_active = false`
-2. 새 버전 레코드: INSERT (`is_active = true`)
-
-### 2. 동의 이력의 불변성 (Append-Only Log)
-
-`consent_history` 레코드도 **INSERT Only**입니다.
-
-```
-동의  → status=AGREED   레코드 INSERT
-철회  → status=WITHDRAWN 레코드 INSERT
-재동의 → status=AGREED   레코드 INSERT
-```
-
-현재 동의 상태는 **가장 최신 레코드의 status** 로 판단합니다.  
-이 방식으로 모든 변경 시점이 타임스탬프와 함께 추적됩니다.
+약관 내용을 그냥 UPDATE로 고치면 사용자가 어떤 버전에 동의했는지 증명할 방법이 없어진다. 분쟁이 생겼을 때 "동의 당시 약관에는 이런 조항이 없었다"는 주장을 반박할 근거가 사라지는 거다. 이 문제를 버전 불변성과 append-only 이력 설계로 어떻게 풀지 구체적으로 구현해보고 싶어서 만들었다.
 
 ---
 
-## ERD
+## 2. 해결한 문제
+
+| 과제 | 구현 방식 |
+|------|-----------|
+| 동의 시점의 약관 내용을 그대로 재현 | `terms_version`을 버전별로 INSERT, `consent_history`에 버전 ID 저장 |
+| 약관 개정 후 재동의 유도 | 최신 이력의 버전과 현행 활성 버전을 비교해 다르면 재동의 허용 |
+| 동일 버전 중복 동의 차단 | 최신 이력이 현행 버전 + AGREED 상태일 때만 예외 발생 |
+| 철회 후 재동의 | 상태값(AGREED/WITHDRAWN) 기반 판단이라 별도 분기 없이 자연스럽게 허용 |
+| 필수 약관 철회 방지 | `terms.isMandatory` 체크 |
+| 감사·분쟁 대응용 이력 보존 | `consent_history`를 UPDATE/DELETE 없이 append-only로 설계 |
+| 스키마 생성 전에 시드 데이터가 먼저 실행되는 문제 | `defer-datasource-initialization`으로 초기화 순서 제어 |
+
+---
+
+## 3. 기술 스택
 
 ```
-┌──────────────────┐       ┌──────────────────────┐       ┌─────────────────────┐
-│      USERS       │       │    TERMS_VERSION     │       │       TERMS         │
-├──────────────────┤       ├──────────────────────┤       ├─────────────────────┤
-│ id (PK)          │       │ id (PK)              │       │ id (PK)             │
-│ username         │       │ terms_id (FK) ───────┼──────▶│ terms_code          │
-│ email            │       │ version              │       │ terms_name          │
-│ created_at       │       │ content              │       │ is_mandatory        │
-└────────┬─────────┘       │ is_active            │       │ created_at          │
-         │                 │ effective_date       │       └─────────────────────┘
-         │                 │ created_at           │
-         │                 └──────────┬───────────┘
-         │                            │
-         │    ┌───────────────────────┘
-         │    │
-         ▼    ▼
-┌───────────────────────────┐
-│      CONSENT_HISTORY      │
-├───────────────────────────┤
-│ id (PK)                   │
-│ user_id (FK)              │
-│ terms_version_id (FK)     │  ← 동의 시점의 버전을 정확히 기록
-│ status (AGREED/WITHDRAWN) │
-│ consented_at              │
-└───────────────────────────┘
+Java 17  /  Spring Boot 3.2
+Spring Data JPA  /  Hibernate 6
+H2 (인메모리, 데모용)
+Bean Validation (spring-boot-starter-validation)
+Lombok
+JUnit 5  /  AssertJ  /  Spring Boot Test
+Maven
 ```
 
-### 테이블 설명
+---
+
+## 4. 아키텍처 개요
+
+```
+클라이언트
+    │
+    ├── GET  /terms, /terms/{id}/versions
+    ├── POST /consent, /consent/withdraw     ──►  ConsentController
+    └── GET  /consent/history
+                                                        │
+                                                 ConsentService
+                                                        │
+                    ┌───────────────┬───────────────────┼───────────────────┐
+              UserRepository  TermsRepository   TermsVersionRepository  ConsentHistoryRepository
+                    │               │                    │                     │
+                    └───────────────┴────────────────────┴─────────────────────┘
+                                                        │
+                                                       JPA
+                                                        │
+                                               H2 (in-memory)
+```
+
+컨트롤러 → 서비스 → 리포지토리로 이어지는 단순한 3계층 구조다. 예외는 서비스에서 던지고, `GlobalExceptionHandler`(`@RestControllerAdvice`) 한 곳에서 상태 코드와 응답 형태를 통일해서 처리한다.
+
+---
+
+## 5. 기술적 선택 근거
+
+### 왜 약관 개정을 UPDATE가 아니라 INSERT로 처리했나
+
+약관 내용을 직접 UPDATE하면 예전 내용이 사라진다. 사용자가 v1.0에 동의했는데 지금 조회하면 v2.0 내용이 보이게 되는 거다. `terms_version` 테이블에 버전마다 새 레코드를 추가하고, 기존 버전은 `is_active`만 false로 바꾼다. `consent_history`에는 어떤 버전에 동의했는지 `terms_version_id`로 정확히 남긴다. 그래서 "이 사용자가 동의한 시점의 약관 내용이 뭐였나"를 언제든 정확히 재현할 수 있다.
+
+### 왜 동의/철회 이력도 UPDATE 없이 계속 쌓기만 하나
+
+처음엔 `users` 테이블에 `is_agreed` 같은 boolean 컬럼 하나 두고 값만 바꾸는 방식도 생각해봤다. 근데 이러면 "언제 동의했다가 언제 철회했는지"가 사라진다. 감사나 분쟁 대응 상황에서는 최종 상태보다 변경 이력 자체가 더 중요한 경우가 많다. 그래서 `consent_history`를 append-only 로그로 설계했다. 동의든 철회든 새 행을 추가만 하고, 현재 상태는 가장 최근 행의 `status`로 판단한다.
+
+### 중복 동의 차단 조건에 버전을 같이 비교하는 이유
+
+처음엔 "이미 AGREED 상태면 무조건 막는다"로 짰다. 근데 이렇게 하면 철회했다가 다시 동의하려는 정상적인 흐름도, 약관이 개정돼서 재동의를 유도해야 하는 흐름도 전부 막힌다. 그래서 조건을 `최신 이력의 버전 == 현행 버전 && 상태 == AGREED`로 바꿨다. 버전이 다르면(개정됨) 재동의를 허용하고, 상태가 WITHDRAWN이면 그것도 재동의를 허용한다. 실제로 막아야 하는 경우는 "지금 버전에 이미 동의한 상태에서 또 동의 요청이 오는" 딱 한 가지뿐이다.
+
+### 철회 이력에도 철회 시점 기준 현행 버전을 기록하는 이유
+
+철회할 때 원래 동의했던 버전이 아니라, 철회 시점의 활성 버전(`findActiveVersion(terms)`)을 참조해서 이력을 남긴다. 철회는 "그때 동의했던 특정 버전"에 대한 게 아니라 "지금 이 약관 자체"에 대한 거부 의사이기 때문이다. 사용자가 v1.0에 동의한 뒤 v2.0으로 개정됐고 그 상태에서 철회하면, 철회 이력은 v2.0을 기준으로 남는 게 감사 관점에서 더 정확하다고 판단했다.
+
+### JPQL에 `LIMIT 1`을 직접 쓴 이유
+
+"특정 유저의 특정 약관에 대한 가장 최근 이력 1건"을 가져와야 하는데, `Pageable`로 `findFirst...By...OrderByDesc` 형태를 쓰는 것보다 JPQL에 `ORDER BY ... LIMIT 1`을 직접 쓰는 게 쿼리 의도가 더 명확했다. Hibernate 6부터 HQL이 `LIMIT` 절을 지원해서 가능했다.
+
+### 응답 DTO는 `@Builder` + 정적 `from()`, 요청 DTO는 필드만 있는 이유
+
+응답 DTO(`ConsentResponse`)는 엔티티 → DTO 변환 로직을 `TermsInfo.from(entity)`처럼 각 DTO 안에 캡슐화했다. 서비스 코드에 매핑 로직이 흩어지는 걸 막기 위해서다. 요청 DTO(`ConsentRequest`)는 반대로 `@NotNull` 필드만 있고 생성자나 setter가 없다. Jackson이 리플렉션으로 필드에 직접 값을 채우기 때문에 실제 API 호출에는 문제가 없는데, 서비스 레이어를 직접 호출하는 단위 테스트에서는 값을 넣을 방법이 없어서 별도 처리가 필요했다. (9번 트러블슈팅 참고)
+
+---
+
+## 6. ERD
+
+```
+┌───────────────────┐       ┌────────────────────────┐       ┌──────────────────────┐
+│       USERS       │       │      TERMS_VERSION     │       │         TERMS        │
+├───────────────────┤       ├────────────────────────┤       ├──────────────────────┤
+│ id            PK  │       │ id                 PK  │       │ id               PK  │
+│ username      UQ  │       │ terms_id           FK ─┼──────►│ terms_code       UQ  │
+│ email         UQ  │       │ version                │       │ terms_name           │
+│ created_at        │       │ content      (TEXT)    │       │ is_mandatory         │
+└──────────┬────────┘       │ is_active              │       │ created_at           │
+           │                │ effective_date         │       └──────────────────────┘
+           │                │ created_at             │
+           │                └────────────┬───────────┘
+           │                             │
+           │      ┌──────────────────────┘
+           ▼      ▼
+┌─────────────────────────────┐
+│       CONSENT_HISTORY       │
+├─────────────────────────────┤
+│ id                      PK  │
+│ user_id                 FK  │
+│ terms_version_id        FK  │  ← 동의/철회 시점의 버전을 정확히 기록
+│ status  (AGREED/WITHDRAWN)  │
+│ consented_at                │
+└─────────────────────────────┘
+
+UNIQUE (terms_id, version)  on TERMS_VERSION
+```
 
 | 테이블 | 역할 |
 |---|---|
 | `USERS` | 사용자 정보 |
 | `TERMS` | 약관 종류 마스터 (서비스 이용약관, 개인정보 처리방침 등) |
-| `TERMS_VERSION` | 약관의 버전별 내용 (불변 레코드) |
-| `CONSENT_HISTORY` | 동의/철회 이력 (Append-Only) |
+| `TERMS_VERSION` | 약관의 버전별 내용 (INSERT-only, 개정 시 새 행 추가) |
+| `CONSENT_HISTORY` | 동의·철회 이력 (INSERT-only, 현재 상태는 최신 행 기준) |
 
 ---
 
-## API 명세
+## 7. API 명세
 
 ### 약관 조회
 
@@ -125,7 +160,7 @@ v2.0 레코드: "약관 내용 v2.0", is_active=true  ← 현행
 
 | Method | URL | 설명 |
 |---|---|---|
-| `POST` | `/consent` | 약관 동의 (최초 동의 / 재동의) |
+| `POST` | `/consent` | 약관 동의 (최초 동의 / 재동의 공용) |
 | `POST` | `/consent/withdraw` | 약관 동의 철회 |
 
 ### 이력 조회
@@ -134,34 +169,7 @@ v2.0 레코드: "약관 내용 v2.0", is_active=true  ← 현행
 |---|---|---|
 | `GET` | `/consent/history?userId={id}` | 사용자 동의 이력 전체 |
 
----
-
-## API 사용 예시
-
-### 1. 현행 약관 목록 조회
-
-```bash
-GET /terms
-```
-
-```json
-{
-  "success": true,
-  "data": [
-    {
-      "termsId": 1,
-      "termsCode": "TERMS_OF_SERVICE",
-      "termsName": "서비스 이용약관",
-      "mandatory": true,
-      "currentVersion": "v2.0",
-      "content": "서비스 이용약관 내용 (v2.0)",
-      "effectiveDate": "2025-01-01T00:00:00"
-    }
-  ]
-}
-```
-
-### 2. 약관 동의
+### 응답 예시 — 약관 동의
 
 ```bash
 POST /consent
@@ -184,12 +192,12 @@ Content-Type: application/json
     "termsName": "서비스 이용약관",
     "version": "v2.0",
     "status": "AGREED",
-    "consentedAt": "2025-06-01T10:00:00"
+    "consentedAt": "2026-07-01T10:00:00"
   }
 }
 ```
 
-### 3. 동의 이력 조회
+### 응답 예시 — 동의 이력 조회
 
 ```bash
 GET /consent/history?userId=1
@@ -200,60 +208,154 @@ GET /consent/history?userId=1
   "success": true,
   "data": {
     "userId": 1,
-    "totalCount": 3,
+    "totalCount": 2,
     "histories": [
-      {
-        "historyId": 3,
-        "termsCode": "MARKETING_CONSENT",
-        "termsName": "마케팅 수신 동의",
-        "mandatory": false,
-        "version": "v1.0",
-        "status": "WITHDRAWN",
-        "consentedAt": "2025-06-01T10:05:00"
-      },
       {
         "historyId": 2,
         "termsCode": "MARKETING_CONSENT",
         "termsName": "마케팅 수신 동의",
         "mandatory": false,
         "version": "v1.0",
+        "status": "WITHDRAWN",
+        "consentedAt": "2026-07-01T10:05:00"
+      },
+      {
+        "historyId": 1,
+        "termsCode": "MARKETING_CONSENT",
+        "termsName": "마케팅 수신 동의",
+        "mandatory": false,
+        "version": "v1.0",
         "status": "AGREED",
-        "consentedAt": "2025-06-01T10:02:00"
+        "consentedAt": "2026-07-01T10:02:00"
       }
     ]
   }
 }
 ```
 
----
-
-## 비즈니스 규칙 요약
-
-| 상황 | 처리 |
-|---|---|
-| 최초 동의 | `/consent` POST → AGREED 이력 INSERT |
-| 이미 동의한 현행 버전에 재요청 | 400 오류 (중복 방지) |
-| 철회 후 재동의 | `/consent` POST 재호출 가능 (허용) |
-| 새 버전 출시 후 재동의 | `/consent` POST 재호출 가능 (다른 버전 ID) |
-| 필수 약관 철회 시도 | 400 오류 |
-| 동의 이력 없이 철회 시도 | 400 오류 |
+모든 응답은 `ApiResponse<T>`(`success`, `message`, `data`, `timestamp`)로 감싸서 반환한다. 에러는 `GlobalExceptionHandler`가 `ResourceNotFoundException` → 404, `ConsentException` → 400, 검증 실패 → 400, 그 외 → 500으로 매핑한다.
 
 ---
 
-## 기술 스택
+## 8. 동의 처리 흐름 상세
 
-| 항목 | 내용 |
-|---|---|
-| Language | Java 17 |
-| Framework | Spring Boot 3.2 |
-| ORM | Spring Data JPA / Hibernate |
-| DB | H2 In-Memory (데모용) |
-| Build | Maven |
-| Test | JUnit 5, Spring Boot Test |
+### 8-1. 최초 동의
+
+```
+클라이언트              서버(ConsentService)             DB
+    │                        │                         │
+    │ POST /consent          │                         │
+    │ {userId, termsId}      │                         │
+    │ ───────────────────────►                         │
+    │                        │── 활성 버전 조회 ───────► │
+    │                        │◄── TermsVersion(active)─│
+    │                        │                         │
+    │                        │── 최신 이력 조회 ─────────►│
+    │                        │◄── 없음(Optional.empty) ─│
+    │                        │                         │
+    │                        │── INSERT consent_history ►│
+    │                        │   (status=AGREED)       │
+    │◄── 200 OK, Result ──────                         │
+```
+
+### 8-2. 동일 버전 중복 동의 차단
+
+```
+클라이언트              서버                            DB
+    │                        │                        │
+    │ POST /consent (동일 termsId, 두 번째 호출)         │
+    │ ───────────────────────►                        │
+    │                        │── 최신 이력 조회 ────────►│
+    │                        │◄── ConsentHistory       │
+    │                        │    (version=v2.0,       │
+    │                        │     status=AGREED)      │
+    │                        │                         │
+    │             latest.version == active.version  && │
+    │             latest.status  == AGREED             │
+    │             → 둘 다 참이면 ConsentException        │
+    │◄── 400, "이미 ... 동의하셨습니다" ──                │
+```
+
+### 8-3. 철회 → 약관 개정 → 재동의
+
+```
+[이력 없음]
+     │ POST /consent   (v1.0 활성)
+     ▼
+[AGREED, v1.0]
+     │
+     │ 약관 개정 → v2.0 활성화
+     │
+     │ POST /consent/withdraw
+     ▼
+[WITHDRAWN, v2.0]   ← 철회 시점 기준 현행 버전으로 기록
+     │
+     │ POST /consent   (재동의)
+     │   latest.status = WITHDRAWN → 통과
+     ▼
+[AGREED, v2.0]
+
+※ v1.0 AGREED, v2.0 WITHDRAWN 이력은 그대로 남아있다.
+  /consent/history 조회 시 3개 행이 전부 보인다.
+```
+
+위 세 시나리오는 각각 `duplicateAgree`, `withdrawOptionalTerms`, `reAgreeAfterWithdraw` 테스트로 검증되어 있다.
 
 ---
 
-## 실행 방법
+## 9. 트러블슈팅
+
+### data.sql이 테이블 생성보다 먼저 실행돼서 빌드가 깨짐
+
+`mvn test`를 돌리면 `data.sql`의 INSERT 문에서 `Table "USERS" not found` 에러가 났다. 이 프로젝트는 `schema.sql` 없이 Hibernate의 `ddl-auto: create-drop`으로 스키마를 만드는 구조인데, Spring Boot는 기본적으로 데이터소스 초기화 스크립트(`data.sql`)를 JPA `EntityManagerFactory`가 만들어지기 전에 실행한다. 그래서 테이블이 아직 없는 상태에서 INSERT가 실행돼 실패했다.
+
+`spring.jpa.defer-datasource-initialization: true`를 `application.yml`에 추가해서 Hibernate가 스키마를 먼저 만들고 나서 `data.sql`이 실행되도록 순서를 바꿨다. `schema.sql`로 스키마를 따로 관리하지 않고 JPA 엔티티에서 스키마를 뽑아 쓰는 구조라면 반드시 챙겨야 하는 옵션이다.
+
+### 재동의 테스트를 짜다가 중복 체크 조건을 다시 잡음
+
+`reAgreeAfterWithdraw` 테스트를 작성하면서, 처음 짰던 "상태만 보고 막는" 로직으로는 철회 후 재동의가 항상 예외를 던진다는 걸 확인했다. 상태를 UPDATE하는 게 아니라 새 행을 추가하는 구조라 최신 행 하나만 보면 되는데, 그 최신 행의 status만 체크하고 버전은 안 보고 있었던 게 원인이었다. 조건에 버전 비교를 추가하고 나서야 중복 동의 차단, 철회 후 재동의, 신규 버전 재동의 세 가지 케이스가 테스트에서 전부 의도대로 갈렸다.
+
+### 테스트에서 요청 DTO에 값을 채울 방법이 없었음
+
+`ConsentRequest.Agree`는 Jackson 역직렬화만 고려해서 `userId`, `termsId` 필드에 `@NotNull`만 붙이고 생성자나 setter를 만들지 않았다. 실제 API 호출에서는 Jackson이 리플렉션으로 처리해주니까 문제가 없는데, 서비스 레이어를 직접 호출하는 단위 테스트에서는 인스턴스를 만든 다음 값을 채울 방법이 없었다. 결국 테스트 클래스에 `setField()` 리플렉션 헬퍼를 만들어서 우회했다. 요청 DTO에도 `@Builder`를 붙이면 해결되긴 하는데, 실제 API 흐름에서는 쓰이지 않을 코드가 늘어나는 셈이라 일단 이 상태로 남겨뒀다. (10번 개선 방향에도 정리했다.)
+
+---
+
+## 10. 한계 및 개선 방향
+
+**신규 약관 버전 발행 API 없음**
+- `TermsVersion`에 `deactivate()` 메서드는 만들어뒀는데, 실제로 이 메서드를 호출해서 새 버전을 발행하는 서비스 로직·API가 없다. 지금은 `data.sql`로 버전 데이터를 미리 심어두는 방식으로만 동작한다. "기존 활성 버전 deactivate + 신규 버전 insert"를 한 트랜잭션으로 묶는 API를 추가해야 실제 운영에서 쓸 수 있다.
+
+**동시 요청에 대한 방어 없음**
+- 같은 유저가 같은 약관에 동의 요청을 동시에 두 번 보내면, `consent_history`에 유니크 제약이나 낙관적 락이 없어서 중복 이력이 쌓일 수 있다. 지금은 순차 호출만 테스트했고 동시성 케이스는 다루지 않았다.
+
+**인증·인가 없음**
+- `userId`를 클라이언트가 그대로 파라미터로 넘긴다. 데모 목적이라 의도적으로 뺐지만, 실서비스라면 로그인한 사용자의 토큰에서 `userId`를 뽑아 쓰도록 바꿔야 한다.
+
+**페이지네이션 없음**
+- `/consent/history`가 사용자의 전체 이력을 한 번에 반환한다. 이력이 오래 쌓이면 응답이 커지므로 페이지네이션이나 기간 필터가 필요하다.
+
+**H2 인메모리 + create-drop**
+- 재시작할 때마다 데이터가 초기화되는 데모용 구성이다. 실제로 쓰려면 PostgreSQL 같은 RDB로 바꾸고, 스키마는 `ddl-auto` 대신 Flyway나 Liquibase로 버전 관리하는 게 맞다.
+
+---
+
+## 11. 테스트
+
+전부 `@SpringBootTest` + `@Transactional`로 구성해서, 각 테스트가 끝나면 롤백돼 `data.sql`로 심어둔 초기 데이터가 깨지지 않는다.
+
+**ConsentServiceTest** (7케이스)
+- `getActiveTermsList` — 활성 약관 목록이 비어있지 않고, 전부 `currentVersion`을 갖고 있는지
+- `agreeTerms` — 선택 약관(마케팅 수신동의)에 동의하면 결과 상태가 AGREED로 오는지
+- `duplicateAgree` — 같은 약관에 두 번 연속 동의하면 두 번째 호출에서 예외가 나는지
+- `cannotWithdrawMandatoryTerms` — 필수 약관(서비스 이용약관)은 동의한 뒤에도 철회 시도 시 예외가 나는지
+- `withdrawOptionalTerms` — 선택 약관은 동의 후 철회하면 상태가 WITHDRAWN으로 바뀌는지
+- `reAgreeAfterWithdraw` — 동의 → 철회 → 재동의 흐름이 전부 정상 처리되는지
+- `getConsentHistory` — 여러 약관에 동의한 뒤 이력 조회 시 전체 개수와 사용자 ID가 맞는지
+
+---
+
+## 12. 실행 방법
 
 ```bash
 # 빌드 및 실행
@@ -268,5 +370,4 @@ http://localhost:8080/h2-console
 # Username: sa / Password: (공백)
 ```
 
-> 애플리케이션 시작 시 `data.sql`에 정의된 샘플 데이터(사용자 2명, 약관 3종, 버전 6개)가 자동으로 삽입됩니다.
-
+애플리케이션 시작 시 `data.sql`에 정의된 샘플 데이터(사용자 2명, 약관 3종, 버전 6개)가 자동으로 삽입된다.
