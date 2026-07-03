@@ -38,6 +38,7 @@
 | 필수 약관 철회 방지 | `terms.isMandatory` 체크 |
 | 감사·분쟁 대응용 이력 보존 | `consent_history`를 UPDATE/DELETE 없이 append-only로 설계 |
 | 스키마 생성 전에 시드 데이터가 먼저 실행되는 문제 | `defer-datasource-initialization`으로 초기화 순서 제어 |
+| 동일 유저의 동시 동의/철회 요청으로 인한 중복 이력 | `agree`/`withdraw` 트랜잭션 앞단에서 `User` 행에 비관적 락(`SELECT ... FOR UPDATE`) 적용 |
 
 ---
 
@@ -101,6 +102,16 @@ Maven
 ### JPQL에 `LIMIT 1`을 직접 쓴 이유
 
 "특정 유저의 특정 약관에 대한 가장 최근 이력 1건"을 가져와야 하는데, `Pageable`로 `findFirst...By...OrderByDesc` 형태를 쓰는 것보다 JPQL에 `ORDER BY ... LIMIT 1`을 직접 쓰는 게 쿼리 의도가 더 명확했다. Hibernate 6부터 HQL이 `LIMIT` 절을 지원해서 가능했다.
+
+### 동시 요청 방어에 DB 유니크 제약 대신 `User` 행 비관적 락을 쓴 이유
+
+`agree()`/`withdraw()`는 "최신 이력 조회 → 판단 → INSERT" 흐름이라, 같은 유저가 같은 약관에 동시에 요청을 보내면 두 트랜잭션이 모두 "중복 아님"으로 읽고 통과해 `AGREED` 이력이 중복 저장될 수 있었다. 처음엔 `consent_history`에 `(user_id, terms_version_id, status)` 유니크 제약을 거는 방법도 생각했는데, 이 스키마는 철회 후 약관 개정 없이 같은 버전으로 재동의하면 동일한 `(user_id, terms_version_id, AGREED)` 조합이 다시 발생할 수 있는 구조라, 유니크 제약을 걸면 정상적인 재동의 흐름까지 막아버린다.
+
+그래서 `UserRepository.findByIdForUpdate()`로 `agree`/`withdraw` 트랜잭션 맨 앞에서 해당 유저의 `User` 행에 `SELECT ... FOR UPDATE`(`@Lock(PESSIMISTIC_WRITE)`)를 건다. 스키마 변경 없이, 같은 유저에 대한 동시 요청을 트랜잭션 단위로 직렬화할 수 있다.
+
+두 번째 요청은 첫 번째 트랜잭션이 커밋될 때까지 대기했다가, 그 후에야 최신 이력을 조회하므로 항상 최신 상태를 보고 정확히 차단한다. 락은 "같은 유저 + 같은 약관"이 아니라 "같은 유저" 단위로 걸리는데, 별도의 락 전용 테이블을 추가하는 것보다 훨씬 단순하고 이 데모 규모의 트래픽에서는 문제가 되지 않는다.
+
+락을 무한 대기하지 않도록 `jakarta.persistence.lock.timeout`을 3초로 설정했고, 타임아웃 시 `PessimisticLockingFailureException`을 `GlobalExceptionHandler`가 409로 매핑한다.
 
 ### 응답 DTO는 `@Builder` + 정적 `from()`, 요청 DTO는 필드만 있는 이유
 
@@ -326,9 +337,6 @@ GET /consent/history?userId=1
 **신규 약관 버전 발행 API 없음**
 - `TermsVersion`에 `deactivate()` 메서드는 만들어뒀는데, 실제로 이 메서드를 호출해서 새 버전을 발행하는 서비스 로직·API가 없다. 지금은 `data.sql`로 버전 데이터를 미리 심어두는 방식으로만 동작한다. "기존 활성 버전 deactivate + 신규 버전 insert"를 한 트랜잭션으로 묶는 API를 추가해야 실제 운영에서 쓸 수 있다.
 
-**동시 요청에 대한 방어 없음**
-- 같은 유저가 같은 약관에 동의 요청을 동시에 두 번 보내면, `consent_history`에 유니크 제약이나 낙관적 락이 없어서 중복 이력이 쌓일 수 있다. 지금은 순차 호출만 테스트했고 동시성 케이스는 다루지 않았다.
-
 **인증·인가 없음**
 - `userId`를 클라이언트가 그대로 파라미터로 넘긴다. 데모 목적이라 의도적으로 뺐지만, 실서비스라면 로그인한 사용자의 토큰에서 `userId`를 뽑아 쓰도록 바꿔야 한다.
 
@@ -352,6 +360,9 @@ GET /consent/history?userId=1
 - `withdrawOptionalTerms` — 선택 약관은 동의 후 철회하면 상태가 WITHDRAWN으로 바뀌는지
 - `reAgreeAfterWithdraw` — 동의 → 철회 → 재동의 흐름이 전부 정상 처리되는지
 - `getConsentHistory` — 여러 약관에 동의한 뒤 이력 조회 시 전체 개수와 사용자 ID가 맞는지
+
+**ConsentConcurrencyTest** (1케이스)
+- `concurrentAgree_onlyOneAgreedHistoryIsSaved` — 같은 유저 + 같은 약관에 `ExecutorService`로 두 스레드를 동시에 출발시켜 `agree()`를 호출했을 때, 하나만 성공하고 `AGREED` 이력이 정확히 1건만 저장되는지 검증. 스레드별로 실제 커넥션/트랜잭션이 필요해 `@Transactional` 롤백 대신 `@AfterEach`에서 직접 데이터를 정리한다.
 
 ---
 

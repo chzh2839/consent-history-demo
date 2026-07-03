@@ -75,7 +75,7 @@ public class ConsentService {
      */
     @Transactional
     public ConsentResponse.Result agree(ConsentRequest.Agree request) {
-        User user = findUser(request.getUserId());
+        User user = findUserForUpdate(request.getUserId());
         Terms terms = findTerms(request.getTermsId());
         TermsVersion activeVersion = findActiveVersion(terms);
 
@@ -121,7 +121,7 @@ public class ConsentService {
      */
     @Transactional
     public ConsentResponse.Result withdraw(ConsentRequest.Withdraw request) {
-        User user = findUser(request.getUserId());
+        User user = findUserForUpdate(request.getUserId());
         Terms terms = findTerms(request.getTermsId());
 
         // 필수 약관 철회 불가
@@ -189,6 +189,16 @@ public class ConsentService {
 
     private User findUser(Long userId) {
         return userRepository.findById(userId)
+                .orElseThrow(() -> new ResourceNotFoundException("사용자를 찾을 수 없습니다. id=" + userId));
+    }
+
+    /**
+     * 유저 row에 비관적 락(SELECT ... FOR UPDATE)을 걸어 조회한다.
+     * 동의/철회처럼 "최신 이력 조회 → 판단 → INSERT"를 수행하는 쓰기 경로 맨 앞에서 호출해,
+     * 동일 유저에 대한 동시 요청을 트랜잭션 단위로 직렬화하기 위함이다.
+     */
+    private User findUserForUpdate(Long userId) {
+        return userRepository.findByIdForUpdate(userId)
                 .orElseThrow(() -> new ResourceNotFoundException("사용자를 찾을 수 없습니다. id=" + userId));
     }
 

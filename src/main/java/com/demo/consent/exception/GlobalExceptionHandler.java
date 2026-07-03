@@ -2,6 +2,7 @@ package com.demo.consent.exception;
 
 import com.demo.consent.dto.ApiResponse;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.dao.PessimisticLockingFailureException;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.MethodArgumentNotValidException;
@@ -17,6 +18,13 @@ public class GlobalExceptionHandler {
         log.warn("ResourceNotFound: {}", ex.getMessage());
         return ResponseEntity.status(HttpStatus.NOT_FOUND)
                 .body(ApiResponse.error(ex.getMessage()));
+    }
+
+    @ExceptionHandler(PessimisticLockingFailureException.class)
+    public ResponseEntity<ApiResponse<Void>> handleLockingFailure(PessimisticLockingFailureException ex) {
+        log.warn("PessimisticLockingFailure: {}", ex.getMessage());
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+                .body(ApiResponse.error("다른 요청이 처리 중입니다. 잠시 후 다시 시도해주세요."));
     }
 
     @ExceptionHandler(ConsentException.class)
