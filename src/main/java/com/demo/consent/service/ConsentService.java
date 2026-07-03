@@ -15,9 +15,14 @@ import com.demo.consent.repository.TermsVersionRepository;
 import com.demo.consent.repository.UserRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.domain.Page;
+import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
 import java.util.List;
 import java.util.Optional;
 import java.util.stream.Collectors;
@@ -163,24 +168,30 @@ public class ConsentService {
     // ───────────────────────────────────────────────
 
     /**
-     * 특정 사용자의 전체 동의 이력 조회
+     * 특정 사용자의 동의 이력 조회 (페이지네이션 + 검색 조건)
+     *
+     * @param termsId 특정 약관으로 필터링 (선택)
+     * @param status  AGREED/WITHDRAWN 상태로 필터링 (선택)
+     * @param from    조회 시작일 (포함, 선택)
+     * @param to      조회 종료일 (포함, 선택)
      */
     @Transactional(readOnly = true)
-    public ConsentResponse.HistoryList getConsentHistory(Long userId) {
+    public ConsentResponse.HistoryList getConsentHistory(
+            Long userId, Long termsId, ConsentStatus status,
+            LocalDate from, LocalDate to, Pageable pageable) {
         User user = findUser(userId);
 
-        List<ConsentHistory> histories =
-                consentHistoryRepository.findAllByUserIdOrderByConsentedAtDesc(user.getId());
+        if (from != null && to != null && from.isAfter(to)) {
+            throw new ConsentException("조회 시작일(from)이 종료일(to)보다 늦을 수 없습니다.");
+        }
 
-        List<ConsentResponse.HistoryItem> items = histories.stream()
-                .map(ConsentResponse.HistoryItem::from)
-                .collect(Collectors.toList());
+        LocalDateTime fromDateTime = from != null ? from.atStartOfDay() : null;
+        LocalDateTime toDateTime = to != null ? to.atTime(LocalTime.MAX) : null;
 
-        return ConsentResponse.HistoryList.builder()
-                .userId(userId)
-                .histories(items)
-                .totalCount(items.size())
-                .build();
+        Page<ConsentHistory> page = consentHistoryRepository.search(
+                user.getId(), termsId, status, fromDateTime, toDateTime, pageable);
+
+        return ConsentResponse.HistoryList.from(userId, page);
     }
 
     // ───────────────────────────────────────────────

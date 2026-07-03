@@ -3,12 +3,18 @@ package com.demo.consent.controller;
 import com.demo.consent.dto.ApiResponse;
 import com.demo.consent.dto.ConsentRequest;
 import com.demo.consent.dto.ConsentResponse;
+import com.demo.consent.enums.ConsentStatus;
 import com.demo.consent.service.ConsentService;
 import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.data.domain.Pageable;
+import org.springframework.data.domain.Sort;
+import org.springframework.data.web.PageableDefault;
+import org.springframework.format.annotation.DateTimeFormat;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
+import java.time.LocalDate;
 import java.util.List;
 
 /**
@@ -80,12 +86,18 @@ public class ConsentController {
     // ───────────────────────────────────────────────
 
     /**
-     * 사용자 동의 이력 조회
-     * GET /consent/history?userId={userId}
+     * 사용자 동의 이력 조회 (페이지네이션 + 검색 조건)
+     * GET /consent/history?userId={userId}&termsId={termsId}&status={AGREED|WITHDRAWN}&from={yyyy-MM-dd}&to={yyyy-MM-dd}&page={page}&size={size}
      */
     @GetMapping("/consent/history")
     public ResponseEntity<ApiResponse<ConsentResponse.HistoryList>> getConsentHistory(
-            @RequestParam Long userId) {
-        return ResponseEntity.ok(ApiResponse.ok(consentService.getConsentHistory(userId)));
+            @RequestParam Long userId,
+            @RequestParam(required = false) Long termsId,
+            @RequestParam(required = false) ConsentStatus status,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate from,
+            @RequestParam(required = false) @DateTimeFormat(iso = DateTimeFormat.ISO.DATE) LocalDate to,
+            @PageableDefault(size = 20, sort = "consentedAt", direction = Sort.Direction.DESC) Pageable pageable) {
+        return ResponseEntity.ok(ApiResponse.ok(
+                consentService.getConsentHistory(userId, termsId, status, from, to, pageable)));
     }
 }

@@ -39,6 +39,8 @@
 | 감사·분쟁 대응용 이력 보존 | `consent_history`를 UPDATE/DELETE 없이 append-only로 설계 |
 | 스키마 생성 전에 시드 데이터가 먼저 실행되는 문제 | `defer-datasource-initialization`으로 초기화 순서 제어 |
 | 동일 유저의 동시 동의/철회 요청으로 인한 중복 이력 | `agree`/`withdraw` 트랜잭션 앞단에서 `User` 행에 비관적 락(`SELECT ... FOR UPDATE`) 적용 |
+| 이력이 쌓일수록 무한정 커지는 응답 크기 | `/consent/history`에 Spring Data `Pageable`/`Page` 기반 페이지네이션 적용 |
+| 특정 약관·상태·기간으로 이력을 좁혀 조회 | `termsId`/`status`/`from`/`to`를 모두 선택 파라미터로 받아 JPQL에서 null 여부로 조건 적용 |
 
 ---
 
@@ -113,6 +115,34 @@ Maven
 
 락을 무한 대기하지 않도록 `jakarta.persistence.lock.timeout`을 3초로 설정했고, 타임아웃 시 `PessimisticLockingFailureException`을 `GlobalExceptionHandler`가 409로 매핑한다.
 
+### `/consent/history`에 `Pageable`/`Page`와 별도 countQuery를 쓴 이유
+
+이력이 쌓일수록 `/consent/history`가 매번 전체 행을 반환하는 게 문제였다. Spring Data JPA가
+이미 제공하는 `Pageable`/`Page` 추상화를 그대로 썼다 — 컨트롤러가 `page`/`size`/`sort` 쿼리
+파라미터를 자동으로 `Pageable`에 바인딩해주고, 별도 설정 없이 스프링 부트가 지원한다.
+
+다만 `JOIN FETCH`가 들어간 쿼리(`ConsentHistoryRepository.search`)에 `Pageable`을 그대로 쓰면,
+Spring Data가 페이지 카운트용 쿼리를 자동으로 유도하다가 `JOIN FETCH` 구문 때문에 실패하거나
+비효율적인 쿼리를 만들 수 있다. 그래서 `@Query`의 `countQuery` 속성에 `JOIN FETCH` 없는 단순
+`COUNT` 쿼리를 직접 지정했다. `JOIN FETCH` 대상이 전부 `ManyToOne`이라 "컬렉션 fetch join은
+페이지네이션과 함께 쓸 수 없다"는 Hibernate 제약에는 걸리지 않는다. 전체 목록이 그대로 필요한
+내부 용도(동시성 테스트 정리 등)를 위해 페이지네이션 없는 `findAllByUserIdOrderByConsentedAtDesc`도
+별도로 남겨뒀다.
+
+정렬 기준은 JPQL에 직접 `ORDER BY`를 넣지 않고 컨트롤러의 `@PageableDefault(sort = "consentedAt", direction = DESC)`에 맡겼다. 그래야 클라이언트가 `sort` 파라미터로 정렬 기준을 바꿀 수 있고, JPQL에 하드코딩된 `ORDER BY`와 `Pageable`의 `Sort`가 충돌할 일도 없다.
+
+### 검색 조건(termsId/status/from/to)
+
+`from`/`to`는 `LocalDate`(날짜)로 받아 서비스에서 `LocalDateTime`(하루의 시작/끝)으로 변환한다.
+`consentedAt`은 타임스탬프라 클라이언트가 매번 시각까지 입력하게 하는 건 불편하고, "그날 하루"
+단위로 조회하는 게 실제 사용 패턴에 가깝다고 판단했다.
+
+`from`이 `to`보다 늦은 경우는 서비스에서 `ConsentException`으로 막아 400을 반환한다.
+
+`status`처럼 enum 파라미터에 잘못된 문자열이 들어오면 스프링이 컨트롤러 진입 전에 `MethodArgumentTypeMismatchException`을 던지는데, 이걸 그대로 두면
+`GlobalExceptionHandler`의 최종 `Exception` 핸들러에 걸려 500으로 응답해버린다. 그래서 이 예외도
+400으로 매핑하는 핸들러를 추가했다.
+
 ### 응답 DTO는 `@Builder` + 정적 `from()`, 요청 DTO는 필드만 있는 이유
 
 응답 DTO(`ConsentResponse`)는 엔티티 → DTO 변환 로직을 `TermsInfo.from(entity)`처럼 각 DTO 안에 캡슐화했다. 서비스 코드에 매핑 로직이 흩어지는 걸 막기 위해서다. 요청 DTO(`ConsentRequest`)는 반대로 `@NotNull` 필드만 있고 생성자나 setter가 없다. Jackson이 리플렉션으로 필드에 직접 값을 채우기 때문에 실제 API 호출에는 문제가 없는데, 서비스 레이어를 직접 호출하는 단위 테스트에서는 값을 넣을 방법이 없어서 별도 처리가 필요했다. (9번 트러블슈팅 참고)
@@ -178,7 +208,16 @@ UNIQUE (terms_id, version)  on TERMS_VERSION
 
 | Method | URL | 설명 |
 |---|---|---|
-| `GET` | `/consent/history?userId={id}` | 사용자 동의 이력 전체 |
+| `GET` | `/consent/history?userId={id}&termsId={termsId}&status={AGREED\|WITHDRAWN}&from={yyyy-MM-dd}&to={yyyy-MM-dd}&page={page}&size={size}` | 사용자 동의 이력 검색 (페이지네이션, 기본값 `page=0`, `size=20`, `consentedAt DESC` 정렬) |
+
+`userId` 외 모든 파라미터는 선택이다.
+
+| 파라미터 | 설명 |
+|---|---|
+| `termsId` | 특정 약관에 대한 이력만 조회 |
+| `status` | `AGREED` 또는 `WITHDRAWN` 상태의 이력만 조회 |
+| `from` / `to` | `yyyy-MM-dd` 형식의 조회 기간(둘 다 포함, `from`은 00:00:00, `to`는 23:59:59.999999999 기준). `from`이 `to`보다 늦으면 400 에러 |
+| `page` / `size` / `sort` | Spring `Pageable` 표준 파라미터 |
 
 ### 응답 예시 — 약관 동의
 
@@ -211,7 +250,7 @@ Content-Type: application/json
 ### 응답 예시 — 동의 이력 조회
 
 ```bash
-GET /consent/history?userId=1
+GET /consent/history?userId=1&status=WITHDRAWN&from=2026-07-01&to=2026-07-01&page=0&size=2
 ```
 
 ```json
@@ -219,7 +258,6 @@ GET /consent/history?userId=1
   "success": true,
   "data": {
     "userId": 1,
-    "totalCount": 2,
     "histories": [
       {
         "historyId": 2,
@@ -229,20 +267,20 @@ GET /consent/history?userId=1
         "version": "v1.0",
         "status": "WITHDRAWN",
         "consentedAt": "2026-07-01T10:05:00"
-      },
-      {
-        "historyId": 1,
-        "termsCode": "MARKETING_CONSENT",
-        "termsName": "마케팅 수신 동의",
-        "mandatory": false,
-        "version": "v1.0",
-        "status": "AGREED",
-        "consentedAt": "2026-07-01T10:02:00"
       }
-    ]
+    ],
+    "page": 0,
+    "size": 2,
+    "totalElements": 1,
+    "totalPages": 1,
+    "hasNext": false
   }
 }
 ```
+
+`termsId`/`status`/`from`/`to`는 자유롭게 조합할 수 있다(예: 특정 약관을 특정 기간 안에서만 조회). `status`에 잘못된 값을 넘기거나 `from`이 `to`보다 늦으면 400으로 응답한다.
+
+`page`는 0부터 시작한다(Spring `Pageable` 기본 관례). `page`/`size` 쿼리 파라미터를 생략하면 기본값(`page=0`, `size=20`)이 적용되고, `sort` 파라미터로 정렬 기준도 바꿀 수 있다(예: `sort=consentedAt,asc`).
 
 모든 응답은 `ApiResponse<T>`(`success`, `message`, `data`, `timestamp`)로 감싸서 반환한다. 에러는 `GlobalExceptionHandler`가 `ResourceNotFoundException` → 404, `ConsentException` → 400, 검증 실패 → 400, 그 외 → 500으로 매핑한다.
 
@@ -340,9 +378,6 @@ GET /consent/history?userId=1
 **인증·인가 없음**
 - `userId`를 클라이언트가 그대로 파라미터로 넘긴다. 데모 목적이라 의도적으로 뺐지만, 실서비스라면 로그인한 사용자의 토큰에서 `userId`를 뽑아 쓰도록 바꿔야 한다.
 
-**페이지네이션 없음**
-- `/consent/history`가 사용자의 전체 이력을 한 번에 반환한다. 이력이 오래 쌓이면 응답이 커지므로 페이지네이션이나 기간 필터가 필요하다.
-
 **H2 인메모리 + create-drop**
 - 재시작할 때마다 데이터가 초기화되는 데모용 구성이다. 실제로 쓰려면 PostgreSQL 같은 RDB로 바꾸고, 스키마는 `ddl-auto` 대신 Flyway나 Liquibase로 버전 관리하는 게 맞다.
 
@@ -352,7 +387,7 @@ GET /consent/history?userId=1
 
 전부 `@SpringBootTest` + `@Transactional`로 구성해서, 각 테스트가 끝나면 롤백돼 `data.sql`로 심어둔 초기 데이터가 깨지지 않는다.
 
-**ConsentServiceTest** (7케이스)
+**ConsentServiceTest** (12케이스)
 - `getActiveTermsList` — 활성 약관 목록이 비어있지 않고, 전부 `currentVersion`을 갖고 있는지
 - `agreeTerms` — 선택 약관(마케팅 수신동의)에 동의하면 결과 상태가 AGREED로 오는지
 - `duplicateAgree` — 같은 약관에 두 번 연속 동의하면 두 번째 호출에서 예외가 나는지
@@ -360,6 +395,11 @@ GET /consent/history?userId=1
 - `withdrawOptionalTerms` — 선택 약관은 동의 후 철회하면 상태가 WITHDRAWN으로 바뀌는지
 - `reAgreeAfterWithdraw` — 동의 → 철회 → 재동의 흐름이 전부 정상 처리되는지
 - `getConsentHistory` — 여러 약관에 동의한 뒤 이력 조회 시 전체 개수와 사용자 ID가 맞는지
+- `getConsentHistory_pagination` — `size`만큼만 잘려서 반환되고 `hasNext`가 올바르게 계산되는지
+- `getConsentHistory_filterByTermsId` — `termsId`로 필터링하면 해당 약관 이력만 나오는지
+- `getConsentHistory_filterByStatus` — `status`로 필터링하면 해당 상태의 이력만 나오는지
+- `getConsentHistory_filterByPeriod` — `from`/`to` 기간 밖의 이력은 제외되고, 기간 안의 이력은 포함되는지
+- `getConsentHistory_invalidPeriod` — `from`이 `to`보다 늦으면 예외가 나는지
 
 **ConsentConcurrencyTest** (1케이스)
 - `concurrentAgree_onlyOneAgreedHistoryIsSaved` — 같은 유저 + 같은 약관에 `ExecutorService`로 두 스레드를 동시에 출발시켜 `agree()`를 호출했을 때, 하나만 성공하고 `AGREED` 이력이 정확히 1건만 저장되는지 검증. 스레드별로 실제 커넥션/트랜잭션이 필요해 `@Transactional` 롤백 대신 `@AfterEach`에서 직접 데이터를 정리한다.
